@@ -1,0 +1,17 @@
+# Runtime data: your library, thumbnails from your movies, and logs
+movie_server_data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Secrets, in case any are ever dropped in here
+*.key
+*key*.txt
+.env
+.env.*
+
+# OS clutter
+Thumbs.db
+desktop.ini
+.DS_Store
