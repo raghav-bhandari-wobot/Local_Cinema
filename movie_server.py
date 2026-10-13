@@ -1,10 +1,11 @@
-"""Movie Server - stream a movie folder to your phone over Wi-Fi.
+"""Local Cinema - stream your movie folders to your phone over Wi-Fi.
 
-Usage:  python movie_server.py ["E:\\Movies"] [port]
+Usage:  python movie_server.py [port]
 
-Open the address it prints on your phone. Movies play in VLC, thumbnails are
-random frames grabbed with ffmpeg, and the last position is remembered.
-Thumbnails and watch progress are stored in ./movie_server_data next to this file.
+Then open http://cinema.local:8000 (or the address it prints) and add your
+movie folders from the PC. Movies play in VLC, thumbnails are random frames
+grabbed with ffmpeg, and the last position is remembered. Folders, thumbnails
+and watch progress are stored in ./movie_server_data next to this file.
 """
 import hashlib
 import json
@@ -15,6 +16,7 @@ import random
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -22,12 +24,17 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-ROOT = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else r"E:\Movies")
-PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
+# Arguments: an optional port, and (for older setups) an optional folder that seeds
+# the folder list the first time the server runs.
+_ARGS = sys.argv[1:]
+PORT = next((int(a) for a in _ARGS if a.isdigit()), 8000)
+SEED_FOLDER = next((os.path.abspath(a) for a in _ARGS if not a.isdigit()), None)
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "movie_server_data")
 THUMB_DIR = os.path.join(DATA_DIR, "thumbs")
 STATE_FILE = os.path.join(DATA_DIR, "library.json")
+FOLDERS_FILE = os.path.join(DATA_DIR, "folders.json")
+MDNS_NAME = "cinema.local"
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v", ".wmv", ".flv", ".ts"}
 CHUNK = 512 * 1024
@@ -84,6 +91,106 @@ def saver():
             save_state()
         except OSError as e:
             log(f"Could not save state: {e}")
+
+
+# ------------------------------------------------------------- folders ----
+
+folders = []  # absolute paths of the library folders, in the order they were added
+
+
+def load_folders():
+    global folders
+    try:
+        with open(FOLDERS_FILE, encoding="utf-8") as fh:
+            folders = [f for f in json.load(fh).get("folders", []) if isinstance(f, str)]
+    except (OSError, ValueError):
+        folders = [SEED_FOLDER] if SEED_FOLDER and os.path.isdir(SEED_FOLDER) else []
+        save_folders()
+
+
+def save_folders():
+    tmp = FOLDERS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"folders": folders}, fh, indent=1)
+    os.replace(tmp, FOLDERS_FILE)
+
+
+def _inside(child, parent):
+    child, parent = os.path.normcase(child), os.path.normcase(parent)
+    return child != parent and child.startswith(parent.rstrip("\\/") + os.sep)
+
+
+def add_folder(path):
+    """Add a library folder. Returns an error message, or None on success."""
+    path = os.path.abspath(path.strip().strip('"'))
+    if not os.path.isdir(path):
+        return "That folder doesn't exist."
+    with lock:
+        for f in folders:
+            if os.path.normcase(f) == os.path.normcase(path):
+                return "That folder is already in your library."
+            if _inside(path, f):
+                return f"It's already included, because it's inside {f}."
+        # a parent replaces any of its subfolders that were added before
+        folders[:] = [f for f in folders if not _inside(f, path)] + [path]
+        save_folders()
+    return None
+
+
+def remove_folder(path):
+    with lock:
+        folders[:] = [f for f in folders if os.path.normcase(f) != os.path.normcase(path)]
+        save_folders()
+
+
+def folder_label(root):
+    name = os.path.basename(root.rstrip("\\/"))
+    return clean_folder(name) if name else root.rstrip("\\/")  # a drive root like E:\ shows as "E:"
+
+
+def is_hidden(path, name):
+    if name.startswith((".", "$")) or name in ("System Volume Information", "Recovery", "Windows"):
+        return True
+    try:
+        return bool(getattr(os.stat(path), "st_file_attributes", 0) & 0x6)  # hidden or system
+    except OSError:
+        return True
+
+
+def browse(path):
+    """Folder listing for the in-page folder picker. '' lists drives and common places."""
+    if not path:
+        if os.name == "nt":
+            roots = [f"{d}:\\" for d in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists(f"{d}:\\")]
+        else:
+            roots = ["/"]
+        home = os.path.expanduser("~")
+        places = [os.path.join(home, n) for n in ("Videos", "Movies", "Downloads", "Desktop")
+                  if os.path.isdir(os.path.join(home, n))]
+        dirs = [{"name": r.rstrip("\\"), "path": r, "kind": "drive"} for r in roots]
+        dirs += [{"name": os.path.basename(p), "path": p, "kind": "place"} for p in places]
+        return {"path": "", "parent": None, "dirs": dirs, "videos": 0}
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        return {"error": "That folder doesn't exist."}
+    dirs, videos = [], 0
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    if e.is_dir() and not is_hidden(e.path, e.name):
+                        dirs.append({"name": e.name, "path": e.path, "kind": "dir"})
+                    elif e.is_file() and os.path.splitext(e.name)[1].lower() in VIDEO_EXT:
+                        videos += 1
+                except OSError:
+                    pass
+    except OSError:
+        return {"error": "Windows didn't allow reading that folder."}
+    dirs.sort(key=lambda d: d["name"].lower())
+    parent = os.path.dirname(path.rstrip("\\/")) if os.path.dirname(path.rstrip("\\/")) != path.rstrip("\\/") else ""
+    if os.name == "nt" and len(path.rstrip("\\")) <= 2:  # E:\ -> back to the drive list
+        parent = ""
+    return {"path": path, "parent": parent, "dirs": dirs, "videos": videos}
 
 
 # --------------------------------------------------------- name parsing ----
@@ -167,29 +274,35 @@ def migrate_id(old, new):
 
 def scan():
     found = {}
-    for dirpath, dirnames, files in os.walk(ROOT):
-        dirnames.sort()
-        for f in sorted(files):
-            if os.path.splitext(f)[1].lower() not in VIDEO_EXT:
-                continue
-            full = os.path.join(dirpath, f)
-            rel = os.path.relpath(full, ROOT)
-            try:
-                st = os.stat(full)
-            except OSError:
-                continue
-            parts = rel.split(os.sep)
-            # id from name + size, so moving a file between folders keeps its progress and thumbnail
-            mid = hashlib.sha1(f"{f}|{st.st_size}".encode("utf-8")).hexdigest()[:12]
-            migrate_id(hashlib.sha1(rel.encode("utf-8")).hexdigest()[:12], mid)
-            info = parse_name(os.path.splitext(f)[0])
-            info.update(
-                id=mid, rel=rel, full=full, name=f, size=st.st_size, added=st.st_mtime,
-                collection=clean_folder(parts[0]) if len(parts) > 1 else "Movies",
-                sub=parse_name(parts[1])["title"] if len(parts) > 2 else None,
-                group="/".join(parts[:2]) if len(parts) > 2 else None,
-            )
-            found[mid] = info
+    with lock:
+        roots = list(folders)
+    for root in roots:
+        label = folder_label(root)
+        for dirpath, dirnames, files in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith((".", "$")))
+            for f in sorted(files):
+                if os.path.splitext(f)[1].lower() not in VIDEO_EXT:
+                    continue
+                full = os.path.join(dirpath, f)
+                rel = os.path.relpath(full, root)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                parts = rel.split(os.sep)
+                # id from name + size, so moving a file between folders keeps its progress and thumbnail
+                mid = hashlib.sha1(f"{f}|{st.st_size}".encode("utf-8")).hexdigest()[:12]
+                migrate_id(hashlib.sha1(rel.encode("utf-8")).hexdigest()[:12], mid)
+                info = parse_name(os.path.splitext(f)[0])
+                info.update(
+                    id=mid, rel=os.path.join(label, rel), full=full, name=f, size=st.st_size,
+                    added=st.st_mtime, root=root,
+                    # each top-level subfolder is a row; loose files go in a row named after the folder
+                    collection=clean_folder(parts[0]) if len(parts) > 1 else label,
+                    sub=parse_name(parts[1])["title"] if len(parts) > 2 else None,
+                    group=root + "|" + "/".join(parts[:2]) if len(parts) > 2 else None,
+                )
+                found[mid] = info
     with lock:
         library.clear()
         library.update(found)
@@ -315,7 +428,345 @@ def movie_json(info):
     }
 
 
+# ------------------------------------------------------------- QR code ----
+# A small QR encoder: byte mode, error correction level M, versions 1-10 (up to 213 bytes).
+
+_QR_BLOCKS = {  # version: (EC codewords per block, [(block count, data codewords per block), ...])
+    1: (10, [(1, 16)]), 2: (16, [(1, 28)]), 3: (26, [(1, 44)]), 4: (18, [(2, 32)]),
+    5: (24, [(2, 43)]), 6: (16, [(4, 27)]), 7: (18, [(4, 31)]), 8: (22, [(2, 38), (2, 39)]),
+    9: (22, [(3, 36), (2, 37)]), 10: (26, [(4, 43), (1, 44)]),
+}
+_QR_ALIGN = {1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30], 6: [6, 34], 7: [6, 22, 38],
+             8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50]}
+_EXP, _LOG = [0] * 512, [0] * 256
+_x = 1
+for _i in range(255):
+    _EXP[_i], _LOG[_x] = _x, _i
+    _x = (_x << 1) ^ (0x11D if _x & 0x80 else 0)
+for _i in range(255, 512):
+    _EXP[_i] = _EXP[_i - 255]
+
+
+def _gmul(a, b):
+    return 0 if a == 0 or b == 0 else _EXP[_LOG[a] + _LOG[b]]
+
+
+def _rs_ec(data, n):
+    gen = [1]
+    for i in range(n):  # product of (x - a^i)
+        nxt = gen + [0]
+        for j, g in enumerate(gen):
+            nxt[j + 1] ^= _gmul(g, _EXP[i])
+        gen = nxt
+    rem = list(data) + [0] * n
+    for i in range(len(data)):
+        c = rem[i]
+        if c:
+            for j in range(1, len(gen)):
+                rem[i + j] ^= _gmul(gen[j], c)
+    return rem[len(data):]
+
+
+def qr_matrix(text):
+    data = text.encode("utf-8")
+    for ver in range(1, 11):
+        ec, groups = _QR_BLOCKS[ver]
+        cap = sum(b * d for b, d in groups)
+        cc_bits = 8 if ver < 10 else 16
+        if 4 + cc_bits + 8 * len(data) <= cap * 8:
+            break
+    else:
+        raise ValueError("text too long for a QR code")
+    bits = []
+    put = lambda v, k: bits.extend((v >> (k - 1 - i)) & 1 for i in range(k))
+    put(0b0100, 4)
+    put(len(data), cc_bits)
+    for b in data:
+        put(b, 8)
+    put(0, min(4, cap * 8 - len(bits)))
+    bits += [0] * (-len(bits) % 8)
+    pad = 0
+    while len(bits) < cap * 8:
+        put((0xEC, 0x11)[pad % 2], 8)
+        pad += 1
+    cw = [int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8)]
+    blocks, ecs, pos = [], [], 0
+    for count, size in groups:
+        for _ in range(count):
+            blocks.append(cw[pos:pos + size])
+            ecs.append(_rs_ec(blocks[-1], ec))
+            pos += size
+    final = [b[i] for i in range(max(map(len, blocks))) for b in blocks if i < len(b)]
+    final += [e[i] for i in range(ec) for e in ecs]
+
+    n = 17 + 4 * ver
+    M = [[False] * n for _ in range(n)]
+    F = [[False] * n for _ in range(n)]
+
+    def setf(x, y, v):
+        M[y][x], F[y][x] = v, True
+
+    for i in range(n):
+        setf(6, i, i % 2 == 0)
+        setf(i, 6, i % 2 == 0)
+    for cx, cy in ((3, 3), (n - 4, 3), (3, n - 4)):
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                if 0 <= cx + dx < n and 0 <= cy + dy < n:
+                    setf(cx + dx, cy + dy, max(abs(dx), abs(dy)) not in (2, 4))
+    al = _QR_ALIGN[ver]
+    for i, ay in enumerate(al):
+        for j, ax in enumerate(al):
+            if (i, j) in ((0, 0), (0, len(al) - 1), (len(al) - 1, 0)):
+                continue
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    setf(ax + dx, ay + dy, max(abs(dx), abs(dy)) != 1)
+
+    def draw_format(mask):
+        d = (0 << 3) | mask  # level M = 0b00
+        rem = d
+        for _ in range(10):
+            rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+        fb = ((d << 10) | rem) ^ 0x5412
+        g = lambda i: (fb >> i) & 1 == 1
+        for i in range(6):
+            setf(8, i, g(i))
+        setf(8, 7, g(6))
+        setf(8, 8, g(7))
+        setf(7, 8, g(8))
+        for i in range(9, 15):
+            setf(14 - i, 8, g(i))
+        for i in range(8):
+            setf(n - 1 - i, 8, g(i))
+        for i in range(8, 15):
+            setf(8, n - 15 + i, g(i))
+        setf(8, n - 8, True)
+
+    draw_format(0)
+    if ver >= 7:
+        rem = ver
+        for _ in range(12):
+            rem = (rem << 1) ^ ((rem >> 11) * 0x1F25)
+        vb = (ver << 12) | rem
+        for i in range(18):
+            a, b = n - 11 + i % 3, i // 3
+            setf(a, b, (vb >> i) & 1 == 1)
+            setf(b, a, (vb >> i) & 1 == 1)
+
+    allbits = [(final[i >> 3] >> (7 - (i & 7))) & 1 for i in range(len(final) * 8)]
+    k, right = 0, n - 1
+    while right >= 1:
+        if right == 6:
+            right = 5
+        for vert in range(n):
+            for j in range(2):
+                x = right - j
+                y = n - 1 - vert if ((right + 1) & 2) == 0 else vert
+                if not F[y][x] and k < len(allbits):
+                    M[y][x] = allbits[k] == 1
+                    k += 1
+        right -= 2
+
+    masks = [lambda x, y: (x + y) % 2 == 0, lambda x, y: y % 2 == 0, lambda x, y: x % 3 == 0,
+             lambda x, y: (x + y) % 3 == 0, lambda x, y: (x // 3 + y // 2) % 2 == 0,
+             lambda x, y: x * y % 2 + x * y % 3 == 0, lambda x, y: (x * y % 2 + x * y % 3) % 2 == 0,
+             lambda x, y: ((x + y) % 2 + x * y % 3) % 2 == 0]
+
+    def penalty(G):
+        p = 0
+        for lines in (G, [list(c) for c in zip(*G)]):
+            for line in lines:
+                run = 1
+                for i in range(1, n + 1):
+                    if i < n and line[i] == line[i - 1]:
+                        run += 1
+                    else:
+                        if run >= 5:
+                            p += run - 2
+                        run = 1
+                s = "".join("1" if v else "0" for v in line)
+                p += 40 * (s.count("00001011101") + s.count("10111010000"))
+        for y in range(n - 1):
+            for x in range(n - 1):
+                if G[y][x] == G[y][x + 1] == G[y + 1][x] == G[y + 1][x + 1]:
+                    p += 3
+        dark = sum(map(sum, G))
+        p += 10 * ((abs(dark * 20 - n * n * 10) + n * n - 1) // (n * n) - 1)
+        return p
+
+    best = None
+    for mi, fn in enumerate(masks):
+        G = [[M[y][x] ^ (not F[y][x] and fn(x, y)) for x in range(n)] for y in range(n)]
+        saved = [row[:] for row in M]
+        M[:] = G
+        draw_format(mi)
+        score = penalty(M)
+        if best is None or score < best[0]:
+            best = (score, [row[:] for row in M])
+        M[:] = saved
+    return best[1]
+
+
+def qr_svg(text):
+    m = qr_matrix(text)
+    n, q = len(m), 4
+    path = "".join(f"M{x + q},{y + q}h1v1h-1z" for y in range(n) for x in range(n) if m[y][x])
+    size = n + 2 * q
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}" shape-rendering="crispEdges">'
+            f'<rect width="{size}" height="{size}" fill="#fff"/><path d="{path}" fill="#000"/></svg>')
+
+
+def qr_text(text):
+    """QR drawn with block characters, for the console (light modules drawn, for dark terminals)."""
+    m = qr_matrix(text)
+    n, q = len(m), 2
+    cell = lambda x, y: 0 <= x < n and 0 <= y < n and m[y][x]
+    rows = []
+    for y in range(-q, n + q, 2):
+        rows.append("".join(" ▀▄█"[(not cell(x, y)) | (not cell(x, y + 1)) << 1] for x in range(-q, n + q)))
+    return "\n".join(rows)
+
+
+# ------------------------------------------------- cinema.local (mDNS) ----
+# Answers multicast DNS lookups for cinema.local with this PC's address, so phones
+# can use one fixed name even when the router gives the PC a different IP.
+
+def local_ips():
+    ips = {"127.0.0.1", lan_ip()}
+    try:
+        ips.update(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    return ips
+
+
+def _ip_for(peer):
+    """The PC's address on the same subnet as the peer (falls back to the default route)."""
+    prefix = peer.rsplit(".", 1)[0] + "."
+    return next((ip for ip in sorted(local_ips()) if ip.startswith(prefix)), lan_ip())
+
+
+def _dns_name(name):
+    return b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\x00"
+
+
+def _read_name(data, i):
+    labels, jumped, end = [], False, i
+    for _ in range(64):
+        ln = data[i]
+        if ln == 0:
+            i += 1
+            break
+        if (ln & 0xC0) == 0xC0:
+            if not jumped:
+                end = i + 2
+            i, jumped = ((ln & 0x3F) << 8) | data[i + 1], True
+            continue
+        labels.append(data[i + 1:i + 1 + ln].decode("ascii", "replace"))
+        i += 1 + ln
+    return ".".join(labels).lower(), (end if jumped else i)
+
+
+def _mdns_answer(ip, qid=0, question=b"", flush=True):
+    head = struct.pack(">HHHHHH", qid, 0x8400, 1 if question else 0, 1, 0, 0)
+    rr = _dns_name(MDNS_NAME) + struct.pack(">HHIH", 1, 0x8001 if flush else 1, 120, 4) + socket.inet_aton(ip)
+    return head + question + rr
+
+
+MDNS_GROUP = "224.0.0.251"
+MDNS_REFRESH = 300  # rebuild the socket every 5 minutes so a Wi-Fi reset can't leave it deaf
+
+
+def mdns_responder():
+    """Keeps cinema.local answering for the life of the server. The socket is rebuilt after any
+    error, after the PC wakes from sleep, when its addresses change, and every few minutes."""
+    last_problem = None
+    while True:
+        try:
+            _mdns_serve()
+            last_problem = None
+        except Exception as e:  # never let the name disappear for good
+            msg = f"{MDNS_NAME} paused ({e}); retrying"
+            if msg != last_problem:  # don't fill the log with the same line every few seconds
+                log(msg)
+                last_problem = msg
+            time.sleep(5)
+
+
+def _mdns_serve():
+    ips = local_ips() - {"127.0.0.1"}
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("", 5353))
+        joined = 0
+        for ip in ips:
+            try:
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                             socket.inet_aton(MDNS_GROUP) + socket.inet_aton(ip))
+                joined += 1
+            except OSError:
+                pass
+        if not joined:
+            raise OSError("no network to announce on")
+        s.settimeout(10)
+        for ip in ips:  # tell everyone where cinema.local is now
+            try:
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ip))
+                s.sendto(_mdns_answer(ip), (MDNS_GROUP, 5353))
+            except OSError:
+                pass
+        started = last_tick = time.time()
+        while True:
+            now = time.time()
+            # rebuild after sleep (a big jump in the clock), on a schedule, or when the addresses change
+            if now - last_tick > 60 or now - started > MDNS_REFRESH:
+                return
+            last_tick = now
+            try:
+                data, addr = s.recvfrom(9000)
+            except socket.timeout:
+                if local_ips() - {"127.0.0.1"} != ips:
+                    return
+                continue
+            except OSError:
+                time.sleep(0.5)  # network briefly gone (sleep/resume); the checks above will rebuild
+                continue
+            _mdns_reply(s, data, addr)
+    finally:
+        s.close()
+
+
+def _mdns_reply(s, data, addr):
+    """Answer any question in this packet that asks for cinema.local."""
+    try:
+        qid, flags, qd = struct.unpack(">HHH", data[:6])
+        if flags & 0x8000:
+            return  # a response, not a question
+        i = 12
+        for _ in range(qd):
+            start = i
+            name, i = _read_name(data, i)
+            qtype, qclass = struct.unpack(">HH", data[i:i + 4])
+            i += 4
+            if name != MDNS_NAME or qtype not in (1, 255):
+                continue
+            ip = _ip_for(addr[0])
+            if addr[1] != 5353:  # a simple resolver asking directly: answer it directly
+                s.sendto(_mdns_answer(ip, qid, data[start:i], flush=False), addr)
+                continue
+            if qclass & 0x8000:  # asked for a unicast reply
+                s.sendto(_mdns_answer(ip), addr)
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ip))
+            s.sendto(_mdns_answer(ip), (MDNS_GROUP, 5353))
+    except (struct.error, IndexError, OSError, UnicodeError, ValueError):
+        pass  # ignore malformed or unrelated packets
+
+
 # ----------------------------------------------------------------- http ----
+
+seen_devices = set()
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -332,8 +783,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.route(head=True)
 
+    def is_local(self):
+        """True when the request comes from this PC. Only the PC may browse and change folders."""
+        ip = self.client_address[0].replace("::ffff:", "")
+        return ip in local_ips() or ip.startswith("127.") or ip == "::1"
+
+    def note_device(self):
+        ip = self.client_address[0].replace("::ffff:", "")
+        if ip not in seen_devices:
+            seen_devices.add(ip)
+            log(f"Device connected: {ip}" + (" (this PC)" if self.is_local() else ""))
+
     def route(self, head):
-        path = urllib.parse.urlparse(self.path).path
+        self.note_device()
+        url = urllib.parse.urlparse(self.path)
+        path = url.path
         if path == "/":
             return self.send_bytes(PAGE.encode(), "text/html; charset=utf-8", head)
         if path == "/api/library":
@@ -341,8 +805,21 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 movies = [movie_json(i) for i in library.values()]
                 pending = len(queued)
-            body = json.dumps({"movies": movies, "pending": pending, "ffmpeg": bool(FFMPEG)})
+                counts = {}
+                for i in library.values():
+                    counts[i["root"]] = counts.get(i["root"], 0) + 1
+                fl = [{"path": f, "name": folder_label(f), "exists": os.path.isdir(f), "count": counts.get(f, 0)}
+                      for f in folders]
+            body = json.dumps({"movies": movies, "pending": pending, "ffmpeg": bool(FFMPEG),
+                               "folders": fl, "canManage": self.is_local(),
+                               "urls": {"name": f"http://{MDNS_NAME}:{PORT}", "ip": f"http://{lan_ip()}:{PORT}"}})
             return self.send_bytes(body.encode(), "application/json", head)
+        if path == "/qr.svg":
+            return self.send_bytes(qr_svg(f"http://{lan_ip()}:{PORT}").encode(), "image/svg+xml", head)
+        if path == "/api/browse":
+            if not self.is_local():
+                return self.send_json({"error": "Folders can only be browsed from the PC running Local Cinema."}, 403)
+            return self.send_json(browse(urllib.parse.parse_qs(url.query).get("path", [""])[0]))
         m = re.fullmatch(r"/thumb/([0-9a-f]{12})\.jpg", path)
         if m:
             f = os.path.join(THUMB_DIR, m[1] + ".jpg")
@@ -356,9 +833,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        m = re.fullmatch(r"/api/movie/([0-9a-f]{12})/(\w+)", urllib.parse.urlparse(self.path).path)
+        self.note_device()
+        path = urllib.parse.urlparse(self.path).path
         length = int(self.headers.get("Content-Length") or 0)
-        self.rfile.read(length)
+        body = self.rfile.read(length)
+        if path == "/api/folders":
+            if not self.is_local():
+                return self.send_json({"error": "Folders can only be changed from the PC running Local Cinema."}, 403)
+            try:
+                req = json.loads(body or b"{}")
+            except ValueError:
+                return self.send_json({"error": "Bad request."}, 400)
+            if req.get("add"):
+                err = add_folder(str(req["add"]))
+                if err:
+                    return self.send_json({"error": err}, 400)
+                log(f"Folder added: {req['add']}")
+            elif req.get("remove"):
+                remove_folder(str(req["remove"]))
+                log(f"Folder removed: {req['remove']}")
+            scan()
+            return self.send_json({"ok": True})
+        m = re.fullmatch(r"/api/movie/([0-9a-f]{12})/(\w+)", path)
         if not m or m[1] not in library:
             return self.send_error(404)
         mid, action = m[1], m[2]
@@ -376,6 +872,15 @@ class Handler(BaseHTTPRequestHandler):
         if action == "thumb":
             enqueue(mid, new_thumb=True)
         self.send_bytes(b'{"ok":true}', "application/json", False)
+
+    def send_json(self, obj, status=200):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def send_bytes(self, body, ctype, head, cache=False):
         self.send_response(200)
@@ -617,10 +1122,82 @@ main{padding-bottom:40px}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media (min-width:900px){.top,.hero .in{padding-left:40px;padding-right:40px}
   .rhead{margin-left:40px;margin-right:40px}.scroller{padding-left:40px;padding-right:40px;scroll-padding:0 40px}.grid{padding:4px 40px}}
+
+/* top bar tools */
+.tools{margin-left:auto;display:flex;gap:8px}
+.top .search{margin-left:0}
+.tbtn{display:inline-flex;align-items:center;gap:7px;height:40px;padding:0 15px;border-radius:999px;border:1px solid var(--line);
+  background:#ffffff10;font-size:14px;font-weight:600;white-space:nowrap;transition:background .15s}
+.tbtn:hover{background:#ffffff1e}
+.tbtn.acc{background:var(--grad);border-color:transparent}
+.tbtn.acc:hover{filter:brightness(1.08)}
+@media (max-width:700px){.tbtn span{display:none}.tbtn{width:40px;padding:0;justify-content:center}}
+
+/* dialogs */
+.dlg{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-end;justify-content:center}
+.dlg[hidden]{display:none}
+.dlg .back{position:absolute;inset:0;background:#000000a8;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);animation:fade .2s}
+.dpanel{position:relative;width:100%;max-width:640px;max-height:92vh;display:flex;flex-direction:column;background:var(--panel);
+  border-radius:20px 20px 0 0;animation:up .28s cubic-bezier(.2,.9,.3,1);padding-bottom:env(safe-area-inset-bottom)}
+@media (min-width:720px){.dlg{align-items:center}.dpanel{border-radius:20px}}
+.dhead{display:flex;align-items:center;gap:12px;padding:20px 22px 14px}
+.dhead h3{margin:0;font-size:21px;letter-spacing:-.01em;flex:1}
+.dclose{width:36px;height:36px;border-radius:50%;background:#ffffff12;display:grid;place-items:center;font-size:16px}
+.dbody{padding:0 22px 22px;overflow:auto}
+.sect{font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:4px 0 10px}
+.fl{display:grid;gap:8px;margin-bottom:22px}
+.frow2{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:12px;background:var(--panel2);border:1px solid var(--line)}
+.frow2 > svg{flex:none;color:var(--accent)}
+.frow2 .fi{flex:1;min-width:0}
+.frow2 b{display:block;font-size:15px}
+.frow2 small{display:block;color:var(--muted);font:12px ui-monospace,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.frow2 .cnt{font-size:12px;color:var(--muted);white-space:nowrap}
+.frow2 .cnt.bad{color:#f0b35a}
+.rm{font-size:13px;font-weight:600;padding:7px 11px;border-radius:8px;color:#ffb4a8;background:#ff4d6d1c}
+.rm.confirm{background:#ff4d6d;color:#fff}
+.pathbar{display:flex;gap:8px;margin-bottom:10px}
+.pathbar input{flex:1;min-width:0;padding:11px 12px;border-radius:10px;border:1px solid var(--line);background:#0e0e14;color:var(--text);
+  font:13px ui-monospace,Consolas,monospace;outline:none}
+.pathbar input:focus{border-color:#ffffff40}
+.pathbar button{padding:0 14px;border-radius:10px;background:#ffffff14;font-size:14px;font-weight:600}
+.dirs{border:1px solid var(--line);border-radius:12px;overflow:auto;max-height:min(40vh,330px);background:#0e0e14}
+.dir{display:flex;align-items:center;gap:11px;width:100%;padding:11px 14px;border-bottom:1px solid #ffffff08;text-align:left;font-size:14.5px}
+.dir:hover{background:#ffffff0d}
+.dir svg{flex:none;color:#c9c9d6}
+.dir .k{margin-left:auto;font-size:11px;color:var(--muted)}
+.dir.up{color:var(--muted)}
+.dempty{padding:18px;color:var(--muted);font-size:14px;text-align:center}
+.addbar{display:flex;align-items:center;gap:14px;margin-top:14px;flex-wrap:wrap}
+.addbar .note{flex:1;min-width:180px;font-size:13px;color:var(--muted);line-height:1.4}
+.addbar .btn{padding:11px 18px}
+.err{color:#ff9b8a;font-size:13.5px;margin-top:10px}
+.btn[disabled]{opacity:.4;pointer-events:none}
+.qrwrap{display:flex;gap:22px;align-items:center;flex-wrap:wrap}
+.qrimg{width:196px;height:196px;border-radius:14px;background:#fff;padding:6px;flex:none}
+.qrimg img{width:100%;height:100%;display:block;image-rendering:pixelated}
+.urls{flex:1;min-width:220px;display:grid;gap:14px;text-align:left}
+.url b{display:block;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+.url code{display:block;font:15px ui-monospace,Consolas,monospace;color:var(--text);word-break:break-all}
+.url small{display:block;color:var(--muted);font-size:12.5px;margin-top:3px;line-height:1.4}
+.welcome{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:96px 16px 40px}
+.wcard{max-width:720px;width:100%;text-align:center}
+.wcard h1{font-size:clamp(32px,6vw,54px);letter-spacing:-.03em;margin:14px 0 12px;line-height:1.05}
+.wcard p{color:var(--muted);font-size:17px;margin:0 auto 26px;max-width:520px;line-height:1.5}
+.wcard .btn{font-size:16px;padding:14px 26px}
+.wqr{margin:40px auto 0;max-width:600px;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:20px}
+.empty .btn{margin-top:14px}
 </style>
 </head><body>
 <header class="top" id="top">
   <div class="brand"><i>&#9654;</i>Cinema</div>
+  <div class="tools">
+    <button class="tbtn" data-dlg="connect" title="Connect your phone">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M14 20h.01M17 20h4v-3"/></svg>
+      <span>Connect phone</span></button>
+    <button class="tbtn acc" data-dlg="folders" title="Add or remove movie folders">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+      <span>Add folder</span></button>
+  </div>
   <label class="search">
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
     <input id="q" type="search" placeholder="Search movies" autocomplete="off">
@@ -630,6 +1207,7 @@ main{padding-bottom:40px}
 <main id="main"></main>
 <div class="fview" id="folder" hidden></div>
 <div class="sheet" id="sheet" hidden><div class="back" data-close></div><div class="panel" id="panel"></div></div>
+<div class="dlg" id="dlg" hidden><div class="back" data-close></div><div class="dpanel" id="dpanel"></div></div>
 <div class="toast" id="toast" hidden><div class="spin"></div><span></span></div>
 
 <script>
@@ -759,7 +1337,7 @@ function renderFolder(key) {
 }
 function hideFolder() { document.getElementById('folder').hidden = true; openFolderKey = null; syncOverflow(); }
 function syncOverflow() {
-  const open = !document.getElementById('sheet').hidden || !document.getElementById('folder').hidden;
+  const open = !document.getElementById('sheet').hidden || !document.getElementById('folder').hidden || !document.getElementById('dlg').hidden;
   document.body.style.overflow = open ? 'hidden' : '';
 }
 
@@ -834,6 +1412,19 @@ function render() {
       ${hits.length ? `<div class="grid">${hits.map(card).join('')}</div>` : '<div class="empty">Nothing matches that.</div>'}</section>`;
     return;
   }
+  if (!INFO.folders.length) {   // first run: no folders yet
+    hero.style.display = 'none';
+    main.innerHTML = `<section class="welcome"><div class="wcard">
+      <div class="kicker">Welcome to Local Cinema</div>
+      <h1>Add your first movie folder</h1>
+      <p>${INFO.canManage
+        ? 'Pick a folder on this PC. Every video inside it, subfolders included, shows up here, ready to stream to your phone.'
+        : 'Folders are added on the PC that runs Local Cinema. Open this page there to pick one.'}</p>
+      ${INFO.canManage ? `<button class="btn primary" data-dlg="folders">&#65291; Add folder</button>
+        <div class="wqr"><div class="sect">Open on your phone</div>${qrBlock()}</div>` : ''}
+    </div></section>`;
+    return;
+  }
   hero.style.display = '';
   renderHero();
   const cont = LIB.filter(inProgress).sort((a, b) => b.last_played - a.last_played);
@@ -843,7 +1434,8 @@ function render() {
   const names = Object.keys(cols).sort((a, b) => (a === 'Movies' ? -1 : b === 'Movies' ? 1 : a.localeCompare(b)));
   main.innerHTML = row('Continue watching', cont, true) + row('Recently added', recent)
     + names.map(n => row(n, groupList(cols[n]))).join('')
-    + (LIB.length ? '' : '<div class="empty">No videos found in the folder.</div>');
+    + (LIB.length ? '' : `<div class="empty">No videos found in your folders yet.<br>
+        <button class="btn" data-dlg="folders">Manage folders</button></div>`);
   wireScrollers();
   if (openFolderKey) renderFolder(openFolderKey);
 }
@@ -851,9 +1443,11 @@ function render() {
 // ---- navigation: folder page and details sheet use browser history so the phone's Back button closes them ----
 function openFolder(key) { openFolderKey = key; renderFolder(key); history.pushState({folder: key}, ''); }
 function openSheet(id) { showSheet(id); history.pushState({folder: openFolderKey, sheet: id}, ''); }
+function openDialog(kind) { showDialog(kind); history.pushState({folder: openFolderKey, dlg: kind}, ''); }
 function goBack() { if (history.state) history.back(); else applyState(null); }
 function applyState(s) {
   if (s && s.sheet) showSheet(s.sheet); else hideSheet();
+  if (s && s.dlg) showDialog(s.dlg); else hideDialog();
   if (s && s.folder) { if (openFolderKey !== s.folder || document.getElementById('folder').hidden) { openFolderKey = s.folder; renderFolder(s.folder); } }
   else hideFolder();
   syncOverflow();
@@ -892,6 +1486,81 @@ function hideSheet() { document.getElementById('sheet').hidden = true; syncOverf
 
 function setLib(movies) { LIB = movies; BY = Object.fromEntries(movies.map(m => [m.id, m])); }
 
+// ---- dialogs: library folders and connect-your-phone ----
+let INFO = {folders: [], canManage: false, urls: {}}, dlgKind = null, browseData = null, rmConfirm = null, dlgErr = '';
+const ICON_FOLDER = '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+const ICON_DRIVE = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 14h.01M11 14h6"/></svg>';
+const baseName = p => p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || p;
+
+function qrBlock() {
+  return `<div class="qrwrap"><div class="qrimg"><img src="/qr.svg" alt="QR code for ${esc(INFO.urls.ip)}"></div>
+    <div class="urls">
+      <div class="url"><b>Scan with your phone camera</b><small>Your phone and this PC need to be on the same Wi-Fi.</small></div>
+      <div class="url"><b>Or type this address</b><code>${esc(INFO.urls.ip || '')}</code><small>Works on any phone. It can change if the router gives the PC a new address.</small></div>
+      <div class="url"><b>Address that never changes</b><code>${esc(INFO.urls.name || '')}</code><small>Works on iPhone and computers. On Android it depends on the browser.</small></div>
+    </div></div>`;
+}
+const dhead = title => `<div class="dhead"><h3>${title}</h3><button class="dclose" data-close aria-label="Close">&#10005;</button></div>`;
+
+function showDialog(kind) {
+  dlgKind = kind;
+  document.getElementById('dlg').hidden = false;
+  if (kind === 'folders' && INFO.canManage && !browseData) loadBrowse('');
+  renderDialog();
+  syncOverflow();
+}
+function hideDialog() { dlgKind = null; rmConfirm = null; dlgErr = ''; document.getElementById('dlg').hidden = true; syncOverflow(); }
+
+function renderDialog() {
+  const p = document.getElementById('dpanel');
+  if (!dlgKind) return;
+  if (dlgKind === 'connect') { p.innerHTML = dhead('Connect your phone') + `<div class="dbody">${qrBlock()}</div>`; return; }
+  const list = INFO.folders.map(f => `<div class="frow2">${ICON_FOLDER}<div class="fi"><b>${esc(f.name)}</b><small>${esc(f.path)}</small></div>
+      <span class="cnt${f.exists ? '' : ' bad'}">${f.exists ? f.count + ' video' + (f.count === 1 ? '' : 's') : 'Not found'}</span>
+      ${INFO.canManage ? `<button class="rm${rmConfirm === f.path ? ' confirm' : ''}" data-rm="${esc(f.path)}">${rmConfirm === f.path ? 'Remove?' : 'Remove'}</button>` : ''}
+    </div>`).join('');
+  let add;
+  if (!INFO.canManage) {
+    add = `<div class="sect">Add a folder</div><p style="color:var(--muted);font-size:14.5px;line-height:1.55;margin:0">
+      Folders are added on the PC that runs Local Cinema, so nobody else on your Wi-Fi can look through its drives.
+      Open <code>${esc(INFO.urls.name || '')}</code> on that PC.</p>`;
+  } else {
+    const b = browseData;
+    const rows = !b ? '<div class="dempty">Loading…</div>'
+      : b.error ? `<div class="dempty">${esc(b.error)}</div>`
+      : (b.parent !== null && b.parent !== undefined ? `<button class="dir up" data-go="${esc(b.parent)}"><span style="width:18px;text-align:center">&#8593;</span>${b.parent ? 'Up to ' + esc(baseName(b.parent)) : 'All drives'}</button>` : '')
+        + (b.dirs.length ? b.dirs.map(d => `<button class="dir" data-go="${esc(d.path)}">${d.kind === 'drive' ? ICON_DRIVE : ICON_FOLDER}${esc(d.name)}${d.kind === 'place' ? '<span class="k">shortcut</span>' : ''}</button>`).join('')
+          : '<div class="dempty">No folders inside this one.</div>');
+    const canAdd = b && !b.error && b.path;
+    add = `<div class="sect">Add a folder</div>
+      <div class="pathbar"><input id="pathIn" value="${esc(b && b.path || '')}" placeholder="Pick a drive below, or paste a path" spellcheck="false" autocomplete="off"><button data-goin>Go</button></div>
+      <div class="dirs">${rows}</div>
+      <div class="addbar"><div class="note">${canAdd
+          ? (b.videos ? `${b.videos} video${b.videos > 1 ? 's' : ''} directly in this folder. Videos in its subfolders are included too.` : 'Videos in this folder and all its subfolders will be added.')
+          : 'Open the folder that holds your movies, then add it.'}</div>
+        <button class="btn primary" data-addf ${canAdd ? '' : 'disabled'}>&#65291; Add ${canAdd ? '&ldquo;' + esc(baseName(b.path)) + '&rdquo;' : 'this folder'}</button></div>
+      ${dlgErr ? `<div class="err">${esc(dlgErr)}</div>` : ''}`;
+  }
+  p.innerHTML = dhead('Library folders') + `<div class="dbody">
+    ${INFO.folders.length ? `<div class="sect">Your folders</div><div class="fl">${list}</div>` : ''}${add}</div>`;
+}
+
+async function loadBrowse(path) {
+  browseData = null; dlgErr = ''; renderDialog();
+  try { browseData = await (await fetch('/api/browse?path=' + encodeURIComponent(path), {cache: 'no-store'})).json(); }
+  catch { browseData = {error: 'Could not reach Local Cinema.'}; }
+  renderDialog();
+}
+async function changeFolders(body) {
+  dlgErr = '';
+  let r, d;
+  try { r = await fetch('/api/folders', {method: 'POST', body: JSON.stringify(body)}); d = await r.json(); }
+  catch { d = {error: 'Could not reach Local Cinema.'}; }
+  if (!r || !r.ok) { dlgErr = d.error || 'That didn\'t work.'; renderDialog(); return false; }
+  await load(true);
+  return true;
+}
+
 function toast(pending, ffmpeg) {
   const t = document.getElementById('toast');
   if (!ffmpeg) { t.hidden = false; t.querySelector('.spin').style.display = 'none'; t.querySelector('span').textContent = 'ffmpeg not found - thumbnails disabled'; return; }
@@ -904,7 +1573,11 @@ async function load(full) {
   try { d = await (await fetch('/api/library', {cache: 'no-store'})).json(); } catch { return; }
   const old = BY;
   setLib(d.movies);
+  const hadFolders = INFO.folders.length;
+  INFO = {folders: d.folders || [], canManage: !!d.canManage, urls: d.urls || {}};
+  if (!full && !hadFolders !== !INFO.folders.length) full = true;  // first folder added or last removed
   toast(d.pending, d.ffmpeg);
+  if (dlgKind) renderDialog();
   if (full) render();
   else for (const m of d.movies) {   // patch in new thumbnails/durations without resetting scroll
     const o = old[m.id];
@@ -916,8 +1589,20 @@ async function load(full) {
 }
 
 document.addEventListener('click', e => {
-  const t = e.target.closest('[data-open],[data-play],[data-start],[data-close],[data-back],[data-act],[data-dir],[data-folder]');
+  const t = e.target.closest('[data-open],[data-play],[data-start],[data-close],[data-back],[data-act],[data-dir],[data-folder],[data-dlg],[data-go],[data-goin],[data-addf],[data-rm]');
   if (!t) return;
+  if (t.dataset.dlg) return dlgKind ? showDialog(t.dataset.dlg) : openDialog(t.dataset.dlg);
+  if (t.dataset.go !== undefined) return loadBrowse(t.dataset.go);
+  if (t.dataset.goin !== undefined) return loadBrowse(document.getElementById('pathIn').value.trim());
+  if (t.dataset.addf !== undefined) {
+    t.disabled = true; t.textContent = 'Adding…';
+    return changeFolders({add: browseData.path}).then(ok => { if (ok) { browseData = null; goBack(); } });
+  }
+  if (t.dataset.rm) {
+    if (rmConfirm !== t.dataset.rm) { rmConfirm = t.dataset.rm; return renderDialog(); }
+    rmConfirm = null;
+    return changeFolders({remove: t.dataset.rm});
+  }
   if (t.dataset.dir) {
     const sc = t.closest('.row').querySelector('.scroller');
     return sc.scrollBy({left: Number(t.dataset.dir) * sc.clientWidth * 0.85, behavior: 'smooth'});
@@ -934,7 +1619,8 @@ document.addEventListener('click', e => {
   }
 });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && (!document.getElementById('sheet').hidden || openFolderKey)) goBack();
+  if (e.key === 'Enter' && e.target.id === 'pathIn') return loadBrowse(e.target.value.trim());
+  if (e.key === 'Escape' && (!document.getElementById('sheet').hidden || openFolderKey || dlgKind)) goBack();
   if (e.key === 'Enter' && e.target.matches('.item')) openSheet(e.target.dataset.open);
 });
 document.getElementById('q').addEventListener('input', render);
@@ -982,25 +1668,37 @@ def lan_ip():
 def main():
     os.makedirs(THUMB_DIR, exist_ok=True)
     load_state()
-    if not (FFMPEG and FFPROBE):
-        log("ffmpeg/ffprobe not found on PATH - thumbnails and resume times are disabled.")
-    threading.Thread(target=worker, daemon=True).start()
-    threading.Thread(target=saver, daemon=True).start()
-    scan()
-    for f in os.listdir(THUMB_DIR) if library else []:  # drop thumbnails of videos that are gone
-        if f.endswith(".jpg") and f[:-4] not in library:
-            try:
-                os.remove(os.path.join(THUMB_DIR, f))
-            except OSError:
-                pass
+    load_folders()
     url = f"http://{lan_ip()}:{PORT}"
     try:
         server = Server(("0.0.0.0", PORT), Handler)
     except OSError:
         log(f"Port {PORT} is busy - Local Cinema is probably already running at {url}")
         return
-    log(f"Serving {ROOT}  ({len(library)} videos)")
-    log(f"Open on your phone:  {url}")
+    if not (FFMPEG and FFPROBE):
+        log("ffmpeg/ffprobe not found on PATH - thumbnails and resume times are disabled.")
+    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=saver, daemon=True).start()
+    threading.Thread(target=mdns_responder, daemon=True).start()
+    scan()
+    # drop thumbnails of videos that are gone, but only when every folder is reachable,
+    # so an unplugged drive doesn't wipe its thumbnails
+    if library and all(os.path.isdir(f) for f in folders):
+        for f in os.listdir(THUMB_DIR):
+            if f.endswith(".jpg") and f[:-4] not in library:
+                try:
+                    os.remove(os.path.join(THUMB_DIR, f))
+                except OSError:
+                    pass
+    log(f"Serving {len(folders)} folder(s), {len(library)} videos" if folders
+        else "No folders yet - open the page on this PC and click Add folder")
+    log(f"Open on your phone:  http://{MDNS_NAME}:{PORT}  or  {url}")
+    try:
+        if sys.stdout and sys.stdout.isatty():
+            sys.stdout.reconfigure(encoding="utf-8")
+            print("\nScan to open on your phone:\n" + qr_text(url) + "\n")
+    except (UnicodeError, OSError, AttributeError, ValueError):
+        pass
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()

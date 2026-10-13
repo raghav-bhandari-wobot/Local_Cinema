@@ -24,12 +24,12 @@ The page only fetches small things (the HTML, a JSON list, thumbnails). The movi
 
 ## Starting up: `main()`
 
-1. Create `movie_server_data/thumbs` and load `library.json`.
-2. Start the worker and saver threads.
-3. `scan()` the movie folder and queue anything missing a thumbnail or running time.
-4. Delete thumbnails for videos that no longer exist. This is skipped if no videos were found, so an unplugged drive doesn't wipe them.
-5. Bind the port **exclusively** (`SO_EXCLUSIVEADDRUSE` on Windows). Windows otherwise lets two programs share a port, so without this a second copy would run alongside the first.
-6. `serve_forever()`.
+1. Create `movie_server_data/thumbs`, load `library.json` and `folders.json`.
+2. Bind the port **exclusively** (`SO_EXCLUSIVEADDRUSE` on Windows). Windows otherwise lets two programs share a port, so without this a second copy would run alongside the first. If the port is taken, log "already running" and exit.
+3. Start the worker, saver and `cinema.local` responder threads.
+4. `scan()` the library folders and queue anything missing a thumbnail or running time.
+5. Delete thumbnails for videos that no longer exist, unless a folder is unreachable.
+6. Print the addresses (and a QR code, when run in a terminal), then `serve_forever()`.
 
 `start_hidden.vbs` launches `python.exe` with a hidden window instead of using `pythonw.exe`. Windows Firewall rules are per program, and a rule for `python.exe` doesn't cover `pythonw.exe`.
 
@@ -44,6 +44,31 @@ The page only fetches small things (the HTML, a JSON list, thumbnails). The movi
 | `POST /api/movie/{id}/played` | The page, on Play | Records the time; orders the *Continue watching* row. |
 | `POST …/watched`, `…/unwatched` | Details panel | Sets the watched flag and clears the saved position. |
 | `POST …/thumb` | *New thumbnail* | Queues a forced re-grab. |
+| `GET /qr.svg` | Connect dialog | A QR code of `http://<PC IP>:<port>`, drawn by the built-in encoder. |
+| `GET /api/browse?path=` | Folder picker (**PC only**) | Lists drives and common places for an empty path, else the subfolders of `path` plus how many videos it holds. |
+| `POST /api/folders` | Folder dialog (**PC only**) | `{"add": path}` or `{"remove": path}`. Rejects missing folders and folders already covered. A parent replaces any of its subfolders already in the list. |
+
+"PC only" means the request must come from one of the PC's own addresses (`127.0.0.1` or its LAN IPs). Other devices get `403`, so nobody else on the Wi-Fi can list your drives.
+
+## Library folders: `folders.json`
+
+The folders you add are stored in `movie_server_data/folders.json`. `scan()` walks each one. Inside a library folder, each top-level subfolder becomes a row, and loose files go in a row named after the library folder. The folder-card key includes the library folder's path, so two libraries with a subfolder of the same name don't get mixed up.
+
+On start-up, thumbnails of videos that no longer exist are deleted, but only when every folder in the list is reachable. An unplugged drive keeps its thumbnails.
+
+## `cinema.local`: `mdns_responder()`
+
+Phones and computers can find each other by name on a local network with multicast DNS: a device asks the whole Wi-Fi "who is `cinema.local`?" on UDP port 5353, group `224.0.0.251`, and the owner answers with its IP. The server runs a small responder thread that:
+
+- joins the multicast group on every network interface of the PC;
+- answers `A` (IPv4) questions for `cinema.local` with the PC's address on the asker's subnet;
+- announces itself at start-up, and again whenever the PC's IP changes.
+
+The router plays no part, so the name keeps working on any network and after the PC gets a new address. Support varies on Android: some browsers send names straight to an internet DNS server and never ask the local network. The IP address in the QR code is the fallback that always works.
+
+## QR codes: `qr_matrix()`
+
+A small, dependency-free QR encoder: byte mode, error-correction level M, versions 1–10 (up to 213 bytes). It builds the data codewords, adds Reed–Solomon error correction over GF(256), interleaves the blocks, places the finder, timing and alignment patterns, then tries all eight masks and keeps the one with the lowest penalty score. `qr_svg()` turns the matrix into an SVG for the page, and `qr_text()` into block characters for the console.
 
 ## Streaming without downloading: `Handler.stream()`
 
